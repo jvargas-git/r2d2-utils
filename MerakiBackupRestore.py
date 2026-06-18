@@ -4,7 +4,10 @@ import json
 import logging
 import re
 import argparse
+import base64
 from datetime import datetime
+import urllib.request
+import urllib.error
 import meraki
 
 # Configure logging
@@ -13,6 +16,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # Configuration Constants
 API_KEY = os.environ.get("MERAKI_KEY", "your_api_key_here")  # Replace with your actual API key or set as environment variable
 BACKUP_DIR = "./meraki_template_backups"
+
+# GitHub Configuration
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GITHUB_REPO = os.environ.get("GITHUB_REPO")  # Expected format: "owner/repo"
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 
 def print_welcome_screen():
     """Prints a clear user guide and operational map for interactive execution sessions."""
@@ -36,16 +44,58 @@ def print_welcome_screen():
     print("                     Bypasses interactive prompts and this welcome screen.")
     print("  -O, --orgname    - Specifies the exact target Meraki Organization Name.")
     print("  -N, --network    - Isolates restoration strictly to a single named network")
-    print("                     by parsing all files to auto-locate its backup layer.\n")
+    print("                     by parsing all files to auto-locate its backup layer.")
+    print("  -G, --github     - Routes backup payloads directly to a remote GitHub")
+    print("                     repository instead of local disk storage.\n")
     print("CONFIGURATION & PATHS:")
-    print(f"  Target Storage Directory : {os.path.abspath(BACKUP_DIR)}")
+    print(f"  Target Local Directory   : {os.path.abspath(BACKUP_DIR)}")
     print(f"  API Key Detected         : {'YES (From Environment)' if os.environ.get('MERAKI_KEY') else 'NO (Using code default)'}")
+    print(f"  GitHub Export Enabled    : {'READY' if GITHUB_TOKEN and GITHUB_REPO else 'NO (Missing GITHUB_TOKEN or GITHUB_REPO)'}")
     print(banner)
-    print("Version 1.0\n")
+    print("Version 1.1\n")
 
 def sanitize_filename(name):
     """Removes special characters to create a safe filename."""
     return re.sub(r'[^a-zA-Z0-9_-]', '_', name)
+
+def upload_to_github(filename, content_str):
+    """Uploads the JSON configuration payload directly to the specified GitHub repository."""
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        logging.error("GitHub upload failed: GITHUB_TOKEN and GITHUB_REPO environment variables must be set.")
+        return False
+
+    logging.info(f"Uploading backup archive '{filename}' to GitHub repo '{GITHUB_REPO}'...")
+    
+    # Clean up filename for repo path structure if needed
+    repo_path = f"backups/{filename}"
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{repo_path}"
+    
+    # Base64 encode file contents as required by GitHub API
+    content_bytes = content_str.encode('utf-8')
+    base64_content = base64.b64encode(content_bytes).decode('utf-8')
+    
+    payload = {
+        "message": f"Automated Meraki DR Backup - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "content": base64_content,
+        "branch": GITHUB_BRANCH
+    }
+    
+    req_data = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(url, data=req_data, method='PUT')
+    req.add_header('Authorization', f'token {GITHUB_TOKEN}')
+    req.add_header('Accept', 'application/vnd.github.v3+json')
+    req.add_header('Content-Type', 'application/json')
+    
+    try:
+        with urllib.request.urlopen(req) as response:
+            if response.status in [200, 201]:
+                logging.info(f"SUCCESS: Securely pushed to GitHub branch '{GITHUB_BRANCH}' at path: {repo_path}")
+                return True
+    except urllib.error.HTTPError as e:
+        logging.error(f"GitHub API Error ({e.code}): {e.read().decode('utf-8')}")
+    except Exception as e:
+        logging.error(f"Failed to connect to GitHub endpoint: {e}")
+    return False
 
 def get_org_id_by_name(dashboard, org_name):
     """Resolves an Organization Name to its unique numeric Organization ID."""
@@ -68,10 +118,10 @@ def get_org_id_by_name(dashboard, org_name):
         logging.error(f"Failed to query organizations via Meraki API: {e}")
         sys.exit(1)
 
-def run_backup(dashboard, org_id, target_template_id=None):
+def run_backup(dashboard, org_id, target_template_id=None, use_github=False):
     """Backs up ALL configuration settings including Global Policy Objects for DR recovery."""
     logging.info(f"Starting worst-case data backup routine for Organization ID: {org_id}")
-    if not os.path.exists(BACKUP_DIR):
+    if not use_github and not os.path.exists(BACKUP_DIR):
         os.makedirs(BACKUP_DIR)
         
     try:
@@ -189,10 +239,16 @@ def run_backup(dashboard, org_id, target_template_id=None):
                     "local_overrides": local_overrides
                 })
                 
-            file_path = os.path.join(BACKUP_DIR, f"template_{safe_filename}{date_suffix}.json")
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(template_data, f, indent=4)
-            logging.info(f"SUCCESS: Payloads compiled and saved to {file_path}")
+            filename = f"template_{safe_filename}{date_suffix}.json"
+            json_string = json.dumps(template_data, indent=4)
+            
+            if use_github:
+                upload_to_github(filename, json_string)
+            else:
+                file_path = os.path.join(BACKUP_DIR, filename)
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(json_string)
+                logging.info(f"SUCCESS: Payloads compiled and saved to {file_path}")
             
     except meraki.APIError as e:
         logging.error(f"Meraki Master Framework API Error: {e}")
@@ -237,7 +293,7 @@ def run_restore(dashboard, org_id, target_filename=None, auto_detect_deletion=Fa
             was_deleted = True if not next((n for n in org_networks if n["name"].lower() == target_network_name.lower()), None) else False
         else:
             if auto_detect_deletion:
-                was_deleted = False if next((t for t in org_templates if t["name"] == template_name), None) else True
+                was_deleted = False if not next((t for t in org_templates if t["name"] == template_name), None) else True
             else:
                 was_deleted_str = input(f"Is this a full template/org disaster rebuild for {template_name}? (yes/no): ").strip().lower()
                 was_deleted = True if was_deleted_str in ['y', 'yes'] else False
@@ -374,6 +430,7 @@ def main():
     parser.add_argument("-A", "--all", action="store_true", help="Target all properties automatically")
     parser.add_argument("-O", "--orgname", type=str, help="The name of your Meraki Organization")
     parser.add_argument("-N", "--network", type=str, help="Isolate restore operations strictly to this single named network")
+    parser.add_argument("-G", "--github", action="store_true", help="Enable direct configuration archival to a GitHub repository")
     
     args = parser.parse_args()
     
@@ -405,7 +462,7 @@ def main():
             
     if args.backup:
         if args.all:
-            run_backup(dashboard_session, org_id, target_template_id=None)
+            run_backup(dashboard_session, org_id, target_template_id=None, use_github=args.github)
         else:
             try:
                 templates = dashboard_session.organizations.getOrganizationConfigTemplates(org_id)
@@ -413,7 +470,7 @@ def main():
                 for idx, t in enumerate(templates):
                     print(f"{idx + 1}. {t['name']} ({t['id']})")
                 sel = int(input("\nSelect a template number to process for backup: ")) - 1
-                run_backup(dashboard_session, org_id, target_template_id=templates[sel]['id'])
+                run_backup(dashboard_session, org_id, target_template_id=templates[sel]['id'], use_github=args.github)
             except (ValueError, IndexError): pass
                 
     elif args.restore:
