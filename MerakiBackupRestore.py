@@ -14,7 +14,7 @@ import meraki
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # Configuration Constants
-API_KEY = os.environ.get("MERAKI_KEY", "your_api_key_here")  #  Set as environment variable. Never hardcode in production code.
+API_KEY = os.environ.get("MERAKI_KEY")  #  Set as environment variable. Never hardcode in production code.
 BACKUP_DIR = "./meraki_template_backups"
 
 # GitHub Configuration
