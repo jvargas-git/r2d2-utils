@@ -233,9 +233,20 @@ def _api_error_messages(e):
 DHCP_DEPENDENT_FIELDS = ("fixedIpAssignments", "reservedIpRanges", "dnsNameservers")
 
 
+def _subnet_is_192168(fields):
+    """True when the backed-up subnet is a 192.168.x.x address."""
+    return fields.get("subnet", "").startswith("192.168.")
+
+
+# Fields that embed host IPs tied to a specific subnet. When the template
+# controls subnetting (192.168 VLANs), pushing these back would fail because
+# the IPs fall outside the template-assigned subnet.
+SUBNET_SPECIFIC_FIELDS = ("subnet", "applianceIp", "reservedIpRanges", "fixedIpAssignments")
+
+
 def _update_vlan(dashboard, network_id, vlan_id, fields):
     """
-    Applies one VLAN update, working around two known Meraki API quirks:
+    Applies one VLAN update, working around known Meraki API quirks:
 
     1. updateNetworkApplianceVlan is all-or-nothing - a single unsupported
        field (e.g. 'ipv6' on a network where IPv6 isn't available) causes
@@ -246,12 +257,22 @@ def _update_vlan(dashboard, network_id, vlan_id, fields):
        against the VLAN's current dhcpHandling, not the new value in the
        same request. If dhcpHandling is also changing, those three fields
        have to go out in a follow-up call once dhcpHandling has taken effect.
+    3. 192.168.x.x VLANs: subnet and applianceIp are controlled by the
+       template's same-subnetting rules and cannot be overridden on a bound
+       network. reservedIpRanges and fixedIpAssignments embed IPs specific to
+       the old subnet and would be rejected against the new one. All four are
+       silently dropped; the template's values are accepted as-is.
 
     Returns a list of human-readable status lines for this VLAN.
     """
     notes = []
     payload = dict(fields)
     deferred = {k: payload.pop(k) for k in DHCP_DEPENDENT_FIELDS if k in payload}
+
+    if _subnet_is_192168(fields):
+        for f in SUBNET_SPECIFIC_FIELDS:
+            payload.pop(f, None)
+            deferred.pop(f, None)
 
     def attempt(data, label):
         try:
@@ -357,7 +378,14 @@ def verify_against_backup_file(dashboard, network_id, path):
         if vlan_id not in current:
             missing.append(vlan_id)
             continue
+        is_192168 = _subnet_is_192168(fields)
         for key, expected in fields.items():
+            # VLAN names can legitimately differ between templates; never flag them.
+            if key == "name":
+                continue
+            # For 192.168 VLANs the template controls subnetting; accept its values.
+            if is_192168 and key in SUBNET_SPECIFIC_FIELDS:
+                continue
             if current[vlan_id].get(key) != expected:
                 mismatches.append((vlan_id, key, expected, current[vlan_id].get(key)))
 
