@@ -218,7 +218,98 @@ def write_backup_file(network, template, vlan_backup):
     return path
 
 
-def restore_vlans(dashboard, network_id, backup, dry_run):
+def _api_error_messages(e):
+    """Best-effort extraction of the 'errors' list Meraki puts in 400 bodies."""
+    msg = getattr(e, "message", None)
+    if isinstance(msg, dict):
+        return msg.get("errors", []) or []
+    # meraki-python-sdk sometimes only exposes this via str(e)
+    return [str(e)]
+
+
+# Fields that the API validates against the VLAN's *current* dhcpHandling
+# value rather than the new one in the same payload. If dhcpHandling is
+# changing, these have to be sent in a second call after the change lands.
+DHCP_DEPENDENT_FIELDS = ("fixedIpAssignments", "reservedIpRanges", "dnsNameservers")
+
+
+def _update_vlan(dashboard, network_id, vlan_id, fields):
+    """
+    Applies one VLAN update, working around two known Meraki API quirks:
+
+    1. updateNetworkApplianceVlan is all-or-nothing - a single unsupported
+       field (e.g. 'ipv6' on a network where IPv6 isn't available) causes
+       the *entire* call to be rejected, including unrelated fields like
+       subnet/applianceIp. If we see that specific error, drop ipv6 and
+       retry the rest.
+    2. fixedIpAssignments/reservedIpRanges/dnsNameservers are validated
+       against the VLAN's current dhcpHandling, not the new value in the
+       same request. If dhcpHandling is also changing, those three fields
+       have to go out in a follow-up call once dhcpHandling has taken effect.
+
+    Returns a list of human-readable status lines for this VLAN.
+    """
+    notes = []
+    payload = dict(fields)
+    deferred = {k: payload.pop(k) for k in DHCP_DEPENDENT_FIELDS if k in payload}
+
+    def attempt(data, label):
+        try:
+            if data:
+                dashboard.appliance.updateNetworkApplianceVlan(network_id, vlan_id, **data)
+            return True
+        except APIError as e:
+            errors = _api_error_messages(e)
+            if any("Ipv6 is not supported" in err for err in errors) and "ipv6" in data:
+                retry_data = {k: v for k, v in data.items() if k != "ipv6"}
+                notes.append(f"    [!] VLAN {vlan_id}: IPv6 not supported here; dropped 'ipv6' and retried.")
+                try:
+                    if retry_data:
+                        dashboard.appliance.updateNetworkApplianceVlan(network_id, vlan_id, **retry_data)
+                    return True
+                except APIError as e2:
+                    notes.append(f"    [-] Failed to restore VLAN {vlan_id} ({label}): {e2}")
+                    return False
+            notes.append(f"    [-] Failed to restore VLAN {vlan_id} ({label}): {e}")
+            return False
+
+    if attempt(payload, "main fields"):
+        notes.append(f"    [+] Restored VLAN {vlan_id} ({fields.get('name')})")
+
+    if deferred:
+        if attempt(deferred, "dhcp-dependent fields"):
+            notes.append(f"    [+] Restored DHCP IP assignment fields for VLAN {vlan_id}")
+
+    return notes
+
+
+def _create_vlan(dashboard, network_id, template_id, vlan_id, fields):
+    """
+    Creates a missing VLAN. Bound networks reject direct VLAN creation
+    ('VLANs cannot be added to bound networks') - in that case the VLAN
+    has to be created on the template itself so it propagates down.
+    """
+    try:
+        dashboard.appliance.createNetworkApplianceVlan(network_id, id=vlan_id, **fields)
+        return [f"    [+] Re-created missing VLAN {vlan_id} ({fields.get('name')})"]
+    except APIError as e:
+        errors = _api_error_messages(e)
+        if any("cannot be added to bound networks" in err for err in errors) and template_id:
+            try:
+                dashboard.appliance.createNetworkApplianceVlan(template_id, id=vlan_id, **fields)
+                return [
+                    f"    [+] Network is bound; created VLAN {vlan_id} ({fields.get('name')}) "
+                    f"on the template instead so it propagates down."
+                ]
+            except APIError as e2:
+                return [
+                    f"    [-] Failed to create VLAN {vlan_id} on the template either: {e2}\n"
+                    f"        You'll need to add VLAN {vlan_id} to the template manually."
+                ]
+        return [f"    [-] Failed to restore VLAN {vlan_id}: {e}"]
+
+
+def restore_vlans(dashboard, network_id, backup, dry_run, template_id=None):
     if dry_run:
         print("[dry-run] Would restore the following VLAN(s) to their pre-migration values:")
         for vlan_id, fields in sorted(backup.items(), key=lambda kv: int(kv[0])):
@@ -232,15 +323,12 @@ def restore_vlans(dashboard, network_id, backup, dry_run):
     current = {str(v["id"]): v for v in dashboard.appliance.getNetworkApplianceVlans(network_id)}
 
     for vlan_id, fields in backup.items():
-        try:
-            if vlan_id in current:
-                dashboard.appliance.updateNetworkApplianceVlan(network_id, vlan_id, **fields)
-                print(f"    [+] Restored VLAN {vlan_id} ({fields.get('name')})")
-            else:
-                dashboard.appliance.createNetworkApplianceVlan(network_id, id=vlan_id, **fields)
-                print(f"    [+] Re-created missing VLAN {vlan_id} ({fields.get('name')})")
-        except APIError as e:
-            print(f"    [-] Failed to restore VLAN {vlan_id}: {e}")
+        if vlan_id in current:
+            for line in _update_vlan(dashboard, network_id, vlan_id, fields):
+                print(line)
+        else:
+            for line in _create_vlan(dashboard, network_id, template_id, vlan_id, fields):
+                print(line)
 
     extras = set(current) - set(backup)
     if extras:
@@ -314,7 +402,7 @@ def migrate(dashboard, network, template, has_appliance, dry_run):
     if vlan_backup:
         if not dry_run:
             print("[*] Restoring VLAN configuration over template defaults...")
-        restore_vlans(dashboard, network_id, vlan_backup, dry_run)
+        restore_vlans(dashboard, network_id, vlan_backup, dry_run, template_id=template["id"])
 
     if not dry_run and has_appliance and backup_path:
         print("[*] Verifying migration against backup file...")
