@@ -40,7 +40,7 @@ current network.
 
 Usage
 -----
-    export MERAKI_DASHBOARD_API_KEY="your_api_key_here"
+    export MERAKI_KEY="your_api_key_here"
 
     python migrate_network.py              # live run
     python migrate_network.py --dry-run     # preview only, no changes
@@ -101,11 +101,11 @@ def parse_args():
 
 
 def get_dashboard():
-    api_key = os.environ.get("MERAKI_DASHBOARD_API_KEY")
+    api_key = os.environ.get("MERAKI_KEY")
     if not api_key:
         sys.exit(
-            "[!] Set the MERAKI_DASHBOARD_API_KEY environment variable first, e.g.\n"
-            "    export MERAKI_DASHBOARD_API_KEY='your_api_key_here'"
+            "[!] Set the MERAKI_KEY environment variable first, e.g.\n"
+            "    export MERAKI_KEY='your_api_key_here'"
         )
     return meraki.DashboardAPI(api_key, suppress_logging=True)
 
